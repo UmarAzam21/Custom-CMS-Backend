@@ -1,0 +1,201 @@
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, BackgroundTasks
+from fastapi.responses import RedirectResponse
+from fastapi.templating import Jinja2Templates
+from sqlalchemy.orm import Session
+
+from app import models
+from app.db import get_db
+
+from app.schema import ContactFormIn, ContactFormOut
+from app.support_system import crud
+from app.support_system.config import settings
+from app.support_system.email_utils import send_email
+from app.support_system.imap_worker import process_mailbox
+
+router = APIRouter()
+templates = None
+
+
+def _safe_status(val):
+    return getattr(val, "value", str(val))
+
+
+def _serialize_message(msg):
+    return {
+        "id": msg.id,
+        "direction": getattr(msg.direction, "value", str(msg.direction)),
+        "sender_email": msg.sender_email,
+        "body": msg.body,
+        "created_at": msg.created_at.isoformat() if getattr(msg, "created_at", None) else None,
+    }
+
+
+def _serialize_ticket(ticket):
+    return {
+        "id": ticket.id,
+        "subject": ticket.subject,
+        "status": _safe_status(ticket.status),
+        "customer": {
+            "id": ticket.customer.id if ticket.customer else None,
+            "email": ticket.customer.email if ticket.customer else None,
+            "name": ticket.customer.name if ticket.customer else None,
+        },
+        "created_at": ticket.created_at.isoformat() if getattr(ticket, "created_at", None) else None,
+        "updated_at": ticket.updated_at.isoformat() if getattr(ticket, "updated_at", None) else None,
+        "messages": [_serialize_message(m) for m in getattr(ticket, "messages", [])],
+    }
+
+
+def require_admin() -> str:
+    return "admin"
+
+
+@router.post("/contact", response_model=ContactFormOut)
+def submit_contact_form(payload: ContactFormIn, db: Session = Depends(get_db)):
+    customer = crud.get_or_create_customer(db, email=payload.email, name=payload.name)
+    ticket = crud.create_ticket_with_message(
+        db, customer=customer, subject=payload.subject, body=payload.message
+    )
+
+    try:
+        send_email(
+            to_address=customer.email,
+            subject=f"[Ticket #{ticket.id}] {ticket.subject}",
+            body=(
+                f"Hi {customer.name or ''},\n\n"
+                "Thanks for reaching out — we've received your message and "
+                "will get back to you soon.\n\n"
+                f"Your message:\n{payload.message}\n\n"
+                "— Support Team"
+            ),
+            reply_to=ticket.reply_to_address,
+        )
+    except Exception:
+        pass
+
+    return ContactFormOut(ticket_id=ticket.id, status=ticket.status.value)
+
+# ---------------------------------------------------------------------------
+# Admin dashboard
+# ---------------------------------------------------------------------------
+
+@router.get("/admin")
+def admin_dashboard(
+    request: Request, db: Session = Depends(get_db), admin: str = Depends(require_admin)
+):
+    tickets = crud.list_tickets(db)
+    return [ _serialize_ticket(t) for t in tickets ]
+
+
+@router.get("/admin/tickets/{ticket_id}")
+def admin_ticket_detail(
+    ticket_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: str = Depends(require_admin),
+):
+    ticket = crud.get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return _serialize_ticket(ticket)
+
+
+@router.get("/admin/tickets/{ticket_id}/reply-to")
+def admin_ticket_reply_to(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    admin: str = Depends(require_admin),
+):
+    ticket = crud.get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return {"ticket_id": ticket_id, "reply_to": ticket.reply_to_address}
+
+
+@router.post("/admin/tickets/{ticket_id}/reply")
+def admin_reply(
+    ticket_id: int,
+    body: str = Form(...),
+    db: Session = Depends(get_db),
+    admin: str = Depends(require_admin),
+):
+    ticket = crud.get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    send_email(
+        to_address=ticket.customer.email,
+        subject=f"Re: [Ticket #{ticket.id}] {ticket.subject}",
+        body=body,
+        reply_to=ticket.reply_to_address,
+    )
+
+    crud.add_message(
+        db,
+        ticket=ticket,
+        direction=models.MessageDirection.OUTBOUND,
+        sender_email=settings.SMTP_USER,
+        body=body,
+    )
+    return {"status": "sent", "ticket_id": ticket_id}
+
+
+@router.post("/admin/tickets/{ticket_id}/close")
+def admin_close_ticket(
+    ticket_id: int,
+    db: Session = Depends(get_db),
+    admin: str = Depends(require_admin),
+):
+    ticket = crud.get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    ticket.status = models.TicketStatus.CLOSED
+    db.commit()
+    db.refresh(ticket)
+
+    return {"status": "closed", "ticket_id": ticket_id, "ticket_status": ticket.status.value}
+
+
+# Development-only helper: simulate an inbound reply (useful when IMAP isn't available)
+@router.post("/admin/tickets/{ticket_id}/simulate-reply")
+def simulate_reply(
+    ticket_id: int,
+    sender_email: str = Form(...),
+    body: str = Form(...),
+    db: Session = Depends(get_db),
+    admin: str = Depends(require_admin),
+):
+    ticket = crud.get_ticket(db, ticket_id)
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    msg = crud.add_message(
+        db,
+        ticket=ticket,
+        direction=models.MessageDirection.INBOUND,
+        sender_email=sender_email,
+        body=body,
+    )
+
+    return {"status": "simulated", "message": _serialize_message(msg), "ticket": _serialize_ticket(ticket)}
+
+
+# Admin endpoint to trigger IMAP processing once. Use `sync=true` to run synchronously.
+@router.post("/admin/process-imap")
+def trigger_imap_processing(
+    background_tasks: BackgroundTasks,
+    sync: bool = False,
+    admin: str = Depends(require_admin),
+):
+    if sync:
+        try:
+            count = process_mailbox()
+            return {"status": "processed", "count": count}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+    else:
+        background_tasks.add_task(process_mailbox)
+        return {"status": "queued"}

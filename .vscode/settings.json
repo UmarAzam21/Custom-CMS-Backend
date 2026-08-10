@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "c:/Users/lenovo/Desktop/filernow backend/venv/Scripts/python.exe",
+  "python.analysis.extraPaths": [
+    "c:/Users/lenovo/Desktop/filernow backend"
+  ],
+  "python.analysis.autoSearchPaths": true,
+"python.analysis.typeCheckingMode": "basic",
+"python-envs.defaultEnvManager": "ms-python.python:system"
+}
