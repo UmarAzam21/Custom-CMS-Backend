@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker , declarative_base
 
-DATABASE_URL = "postgresql://postgres:umar123@localhost:5432/cms_db"
+DATABASE_URL = "DB Credentials & Add env"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
