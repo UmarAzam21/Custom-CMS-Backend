@@ -6,26 +6,41 @@ import cloudinary
 import cloudinary.uploader
 from xml.etree import ElementTree as ET
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from typing import Any, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
 from sqlalchemy.orm import Session
 from .enums import ServiceType
 from app.email_utils import send_email
 from .db import get_db
-from .models import AdminUser, ContentBlock, Page, SiteSetting, Media, Message, PasswordResetToken, Notification
+from .models import AdminUser, ContentBlock, Lead, Page, Role, SiteSetting, Media, Message, PasswordResetToken, Notification
 from .schema import (
     ContentBlockCreate,
     ContentBlockResponse,
     ForgotPasswordRequest,
+    LeadsResponse,
     LoginRequest,
     MessageCreate,
     MessageResponse,
     ReplyRequest,
     ResetPasswordRequest,
+    RoleCreate,
+    RoleResponse,
+    RoleUpdate,
+    AssignRoleRequest,
+    AdminUserWithRoleResponse,
     SiteSettingUpdate,
     SiteSettingResponse,
+    SiteIdentity,
+    SiteIdentityResponse,
+    BrandAssets,
+    BrandAssetsResponse,
+    SocialMediaLinks,
     Token,
     AdminUserCreate,
     AdminUserResponse,
+    AdminProfileUpdate,
+    MeResponse,
     PageCreate,
     PageResponse,
     NotificationCreate,
@@ -33,15 +48,43 @@ from .schema import (
     NotificationListResponse,
     UnreadCountResponse,
     MarkReadRequest,
+    LeadExportRequest,
 )
 
-from .auth import hash_password, verify_password, create_access_token, get_current_admin
+import csv
+from fastapi.responses import StreamingResponse
+
+
+
+from sqlalchemy.orm import Session
+from openpyxl import Workbook
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+
+
+from .auth import hash_password, verify_password, create_access_token, get_current_admin, require_module, require_super_admin
+from .init_roles import init_builtin_roles, get_builtin_role_names
 
 import os
 from pathlib import Path
 
+
+
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env"
+
+
+FIELD_MAP = {
+    "id": ("ID", lambda l: l.id),
+    "username": ("Name", lambda l: l.username),
+    "email": ("Email", lambda l: l.email),
+    "phone": ("Phone", lambda l: l.phone),
+    "service_type": ("Service Type", lambda l: l.service_type.value if hasattr(l.service_type, "value") else l.service_type),
+    "city": ("City", lambda l: l.city),
+    "created_at": ("Created At", lambda l: l.created_at.isoformat() if l.created_at else ""),
+}
 
 
 def _load_env_file(path: Path) -> None:
@@ -69,11 +112,51 @@ cloudinary.config(
 )
 
 
+def upload_profile_image_to_cloudinary(file_obj: Any, filename: Optional[str] = None) -> str:
+    """Upload a user profile image to Cloudinary and return its secure URL."""
+    if file_obj is None:
+        raise ValueError("No image file provided")
+
+    file_data = file_obj.read() if hasattr(file_obj, "read") else file_obj
+    if not file_data:
+        raise ValueError("Uploaded image is empty")
+
+    base_name = Path(filename or "profile-image").stem or "profile-image"
+    public_id = f"admin_profile_{base_name}_{uuid.uuid4()}"
+
+    upload_result = cloudinary.uploader.upload(
+        file_data,
+        resource_type="image",
+        folder="admin/profile-images",
+        public_id=public_id,
+        transformation=[{"quality": "auto:good", "fetch_format": "auto"}],
+    )
+    return upload_result["secure_url"]
+
+
+def build_admin_dashboard_summary(
+    page_count: Optional[int] = None,
+    new_message_count: Optional[int] = None,
+    last_content_update: Optional[dict[str, Any]] = None,
+    seo_health_score: Optional[int] = None,
+    admin_leads: Optional[int] = None,
+    recent_activity: Optional[list[dict[str, Any]]] = None,
+) -> dict[str, Any]:
+    """Build the summary payload used by the admin dashboard cards and activity panel."""
+    return {
+        "total_pages": int(page_count or 0),
+        "new_messages": int(new_message_count or 0),
+        "last_content_update": last_content_update or {"label": "No content yet", "time": "N/A"},
+        "seo_health_score": int(seo_health_score if seo_health_score is not None else 82),
+        "admin_leads": int(admin_leads if admin_leads is not None else 0),
+        "recent_activity": recent_activity or [],
+    }
+
+
 router = APIRouter()
 
 # ---------------- Notifications (integrated) ----------------
 from fastapi import WebSocket, WebSocketDisconnect, Query, BackgroundTasks
-from typing import Any, List, Optional
 from sqlalchemy import func
 
 
@@ -241,6 +324,37 @@ class _WSManager:
 ws_manager = _WSManager()
 
 
+def resolve_notification_user_id(current_admin: Optional[dict] = None, db: Optional[Session] = None, fallback: str = "admin") -> str:
+    """Return the canonical user id used for notifications and WebSocket routing.
+
+    Prefer the authenticated admin email, then the admin numeric id, and finally a
+    database-backed admin email as a fallback. This keeps the notification API and
+    the websocket connection route in sync.
+    """
+    if isinstance(current_admin, dict):
+        for key in ("email", "user_email"):
+            value = current_admin.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+
+        for key in ("id", "user_id"):
+            value = current_admin.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+
+        for key in ("name",):
+            value = current_admin.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+
+    if db is not None:
+        admin = db.query(AdminUser).order_by(AdminUser.id.asc()).first()
+        if admin and admin.email:
+            return str(admin.email).strip()
+
+    return str(fallback).strip() or "admin"
+
+
 async def notify(user_id: str, resource_type: str, title: str, resource_id: Optional[str] = None, type_: str = "system", message: Optional[str] = None, data: Optional[dict] = None, db: Session = None) -> None:
     """Create a notification and push it live to connected WebSocket clients.
 
@@ -349,9 +463,67 @@ async def websocket_notifications(websocket: WebSocket, user_id: str):
     finally:
         await ws_manager.disconnect(user_id, websocket)
 
-# ---------- Create Admin (sirf ek dafa khud use karne ke liye) ----------
+# ---------- Bootstrap Superadmin ----------
+@router.get("/api/admin/diagnosis")
+def diagnose_admin_users(db: Session = Depends(get_db)):
+    """Diagnostic endpoint to check admin users in database. Useful for debugging."""
+    all_users = db.query(AdminUser).all()
+    superadmin = db.query(AdminUser).filter(AdminUser.role == "superadmin").first()
+    
+    return {
+        "total_admin_users": len(all_users),
+        "has_superadmin": superadmin is not None,
+        "all_users": [
+            {
+                "id": u.id,
+                "name": u.name,
+                "email": u.email,
+                "role": u.role,
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+            }
+            for u in all_users
+        ],
+    }
+
+
+@router.delete("/api/admin/reset-all-users")
+def reset_all_admin_users(db: Session = Depends(get_db)):
+    """DANGEROUS: Delete all admin users to reset the system. 
+    Use this ONLY if you're locked out and need to start fresh."""
+    count = db.query(AdminUser).delete()
+    db.commit()
+    return {
+        "status": "success",
+        "message": f"Deleted {count} admin user(s). You can now create a new superadmin.",
+        "deleted_count": count,
+    }
+
+
 @router.post("/api/admin/create-user", response_model=AdminUserResponse)
-def create_admin(user: AdminUserCreate, db: Session = Depends(get_db)):
+def create_superadmin(user: AdminUserCreate, db: Session = Depends(get_db)):
+    # Check if a superadmin already exists
+    existing_superadmin = db.query(AdminUser).filter(AdminUser.role == "superadmin").first()
+    if existing_superadmin:
+        raise HTTPException(
+            status_code=400,
+            detail="Superadmin already exists. Use /api/admin/users to create additional admin users.",
+        )
+
+    new_user = AdminUser(
+        name=user.name,
+        email=user.email,
+        password_hash=hash_password(user.password),
+        role="superadmin"
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+@router.post("/api/admin/users", response_model=AdminUserResponse)
+def create_admin_user(user: AdminUserCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Create a new admin user. Only super admin can create users."""
     existing = db.query(AdminUser).filter(AdminUser.email == user.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -360,14 +532,56 @@ def create_admin(user: AdminUserCreate, db: Session = Depends(get_db)):
         name=user.name,
         email=user.email,
         password_hash=hash_password(user.password),
-        role="admin"
+        role=user.role or "admin"
     )
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
     return new_user
 
-# ---------- Login ----------
+@router.get("/api/admin/users", response_model=list[AdminUserResponse])
+def list_admin_users(db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """List all admin users. Only super admin can view users."""
+    return db.query(AdminUser).all()
+
+
+@router.put("/api/admin/users/{user_id}", response_model=AdminUserResponse)
+def update_admin_user(user_id: int, user: AdminUserCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Update an admin user's name, email, and password. Only super admin can update users."""
+    existing = db.query(AdminUser).filter(AdminUser.id == user_id).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing.name = user.name
+    existing.email = user.email
+    if user.password:
+        existing.password_hash = hash_password(user.password)
+
+    db.commit()
+    db.refresh(existing)
+    return existing
+
+@router.post("/api/admin/users/{user_id}/assign-role", response_model=AdminUserWithRoleResponse)
+def assign_role_to_user(user_id: int, request: AssignRoleRequest, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Assign a role to a user. Only super admin can assign roles."""
+    # Verify the role exists
+    role = db.query(Role).filter(Role.name == request.role).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    
+    # Verify the user exists
+    user = db.query(AdminUser).filter(AdminUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Prevent reassigning superadmin role
+    if request.role == "superadmin" and user.role != "superadmin":
+        raise HTTPException(status_code=400, detail="Cannot assign superadmin role")
+    
+    user.role = request.role
+    db.commit()
+    db.refresh(user)
+    return user
 @router.post("/api/admin/login", response_model=Token)
 def login(credentials: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(AdminUser).filter(AdminUser.email == credentials.email).first()
@@ -379,15 +593,226 @@ def login(credentials: LoginRequest, db: Session = Depends(get_db)):
 
 
         #   Protected Route
-          
-
+        
 @router.get("/api/admin/me")
 def read_current_admin(current_admin: dict = Depends(get_current_admin)):
-    return {"logged_in_as": current_admin}
+    # Extract module names from modules list (which can contain dicts or strings)
+    modules = current_admin.get("modules", [])
+    permissions = []
+    for m in modules:
+        if isinstance(m, dict):
+            permissions.extend(m.keys())
+        else:
+            permissions.append(m)
+
+    db = next(get_db())
+    try:
+        user = db.query(AdminUser).filter(AdminUser.email == current_admin["email"]).first()
+        profile_image = getattr(user, "profile_image", None) if user else None
+        phone_number = getattr(user, "phone_number", None) if user else None
+        bio = getattr(user, "bio", None) if user else None
+    finally:
+        db.close()
+
+    return MeResponse(
+        name=current_admin["name"],
+        email=current_admin["email"],
+        role=current_admin["role"],
+        profile_image=profile_image,
+        phone_number=phone_number,
+        bio=bio,
+        permissions=permissions,
+    )
+
+
+@router.get("/api/admin/dashboard")
+def get_admin_dashboard(
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    """Return the dashboard summary used by the admin home screen."""
+    page_count = db.query(Page).count()
+    new_message_count = db.query(Message).filter(Message.status == "new").count()
+
+    latest_page = db.query(Page).order_by(Page.id.desc()).first()
+    if latest_page:
+        last_content_update = {"label": f"{latest_page.title} — {latest_page.slug}", "time": "Just now"}
+    else:
+        last_content_update = {"label": "No content yet", "time": "N/A"}
+
+    recent_activity = []
+    for page in db.query(Page).order_by(Page.id.desc()).limit(3):
+        recent_activity.append({
+            "title": f"Published page: {page.title}",
+            "detail": f"{page.slug} • recently updated",
+        })
+
+    if not recent_activity:
+        recent_activity = [{
+            "title": "Create a new page",
+            "detail": "Start building your site",
+        }]
+
+    admin_leads = db.query(Lead).count()
+    seo_health_score = 82 if page_count == 0 else min(99, 78 + page_count)
+
+    return build_admin_dashboard_summary(
+        page_count=page_count,
+        new_message_count=new_message_count,
+        last_content_update=last_content_update,
+        seo_health_score=seo_health_score,
+        admin_leads=admin_leads,
+        recent_activity=recent_activity,
+    )
+
+
+@router.get("/api/admin/overview")
+def get_admin_overview(
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    return get_admin_dashboard(db=db, current_admin=current_admin)
+
+
+@router.post("/api/admin/profile/upload-image")
+async def upload_profile_image(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    """Upload the current admin's profile photo to Cloudinary and persist the secure URL."""
+    user = db.query(AdminUser).filter(AdminUser.email == current_admin["email"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Admin user not found")
+
+    try:
+        profile_image_url = upload_profile_image_to_cloudinary(file.file, filename=file.filename)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not upload profile image: {exc}") from exc
+
+    user.profile_image = profile_image_url
+    db.commit()
+    db.refresh(user)
+    return {"profile_image": user.profile_image}
+
+
+@router.patch("/api/admin/profile", response_model=AdminUserResponse)
+def update_own_profile(
+    payload: AdminProfileUpdate,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    """Allow the logged-in admin to update their basic profile details."""
+    user = db.query(AdminUser).filter(AdminUser.email == current_admin["email"]).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Admin user not found")
+
+    if payload.name is not None:
+        user.name = payload.name.strip() or user.name
+
+    if payload.profile_image is not None and hasattr(user, "profile_image"):
+        cleaned_url = payload.profile_image.strip()
+        user.profile_image = cleaned_url or None
+
+    if payload.phone_number is not None and hasattr(user, "phone_number"):
+        user.phone_number = payload.phone_number.strip() or None
+
+    if payload.bio is not None and hasattr(user, "bio"):
+        user.bio = payload.bio.strip() or None
+
+    if payload.current_password is not None or payload.new_password is not None:
+        if not payload.current_password or not payload.new_password:
+            raise HTTPException(status_code=400, detail="Both current_password and new_password are required together.")
+        if not verify_password(payload.current_password, user.password_hash):
+            raise HTTPException(status_code=400, detail="Current password is incorrect.")
+        if len(payload.new_password.strip()) < 6:
+            raise HTTPException(status_code=400, detail="New password must be at least 6 characters long.")
+        user.password_hash = hash_password(payload.new_password.strip())
+
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.post("/api/admin/roles", response_model=RoleResponse)
+def create_role(role: RoleCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Create a new role with module access levels. Only super admin can create roles."""
+    existing = db.query(Role).filter(Role.name == role.name).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Role already exists")
+
+    new_role = Role(name=role.name, label=role.label, modules=role.modules)
+    db.add(new_role)
+    db.commit()
+    db.refresh(new_role)
+    return new_role
+
+
+@router.get("/api/admin/roles", response_model=list[RoleResponse])
+def list_roles(db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """List all roles. Only super admin can view roles."""
+    return db.query(Role).all()
+
+
+@router.get("/api/admin/roles/{role_name}", response_model=RoleResponse)
+def get_role(role_name: str, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Get a specific role. Only super admin can view roles."""
+    role = db.query(Role).filter(Role.name == role_name).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    return role
+
+
+@router.put("/api/admin/roles/{role_name}", response_model=RoleResponse)
+def update_role(role_name: str, payload: RoleUpdate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Update a role's modules and access levels. Only super admin can update roles."""
+    existing = db.query(Role).filter(Role.name == role_name).first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="Role not found")
+
+    if payload.label is not None:
+        existing.label = payload.label
+    if payload.modules is not None:
+        existing.modules = payload.modules
+
+    db.commit()
+    db.refresh(existing)
+    return existing
+
+
+@router.delete("/api/admin/roles/{role_name}")
+def delete_role(role_name: str, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Delete a role. Only super admin can delete roles."""
+    if role_name == "superadmin":
+        raise HTTPException(status_code=400, detail="Cannot delete superadmin role")
+    
+    role = db.query(Role).filter(Role.name == role_name).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    db.delete(role)
+    db.commit()
+    return {"deleted": True}
+
+
+@router.post("/api/admin/roles/init-builtin")
+def initialize_builtin_roles(db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
+    """Initialize/reset built-in roles. Only super admin can do this."""
+    try:
+        init_builtin_roles(db)
+        return {"status": "success", "message": "Built-in roles initialized"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/api/admin/roles/builtin/list")
+def list_builtin_roles(current_admin: dict = Depends(require_super_admin)):
+    """List all built-in role names. Only super admin can view."""
+    builtin_roles = get_builtin_role_names()
+    return {"builtin_roles": builtin_roles, "count": len(builtin_roles)}
 
 
 @router.post("/api/admin/pages", response_model=PageResponse)
-def create_page(page: PageCreate, db: Session = Depends(get_db), current_admin: dict = Depends(get_current_admin)):
+def create_page(page: PageCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_module("pages"))):
     existing = db.query(Page).filter(Page.slug == page.slug).first()
     if existing:
         raise HTTPException(status_code=400, detail="Page with this slug already exists")
@@ -400,7 +825,7 @@ def create_page(page: PageCreate, db: Session = Depends(get_db), current_admin: 
 
 
 @router.get("/api/admin/pages", response_model=list[PageResponse])
-def list_pages(db: Session = Depends(get_db), current_admin: dict = Depends(get_current_admin)):
+def list_pages(db: Session = Depends(get_db), current_admin: dict = Depends(require_module("pages"))):
     return db.query(Page).all()
 
 
@@ -486,7 +911,7 @@ def get_public_page(slug: str, db: Session = Depends(get_db)):
 # ================= SITE SETTINGS (Admin - Protected) =================
 
 @router.put("/api/admin/settings/{key}", response_model=SiteSettingResponse)
-def update_setting(key: str, setting: SiteSettingUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_admin: dict = Depends(get_current_admin)):
+def update_setting(key: str, setting: SiteSettingUpdate, background_tasks: BackgroundTasks, db: Session = Depends(get_db), current_admin: dict = Depends(require_module("settings"))):
     existing = db.query(SiteSetting).filter(SiteSetting.key == key).first()
 
     if existing:
@@ -527,7 +952,7 @@ def update_setting(key: str, setting: SiteSettingUpdate, background_tasks: Backg
 
 
 @router.get("/api/admin/settings", response_model=list[SiteSettingResponse])
-def list_settings(db: Session = Depends(get_db), current_admin: dict = Depends(get_current_admin)):
+def list_settings(db: Session = Depends(get_db), current_admin: dict = Depends(require_module("settings"))):
     return db.query(SiteSetting).all()
 
 
@@ -540,6 +965,156 @@ def get_public_settings(db: Session = Depends(get_db)):
     for s in settings:
         result[s.key] = s.value
     return result
+
+
+# ================= SITE IDENTITY =================
+
+@router.get("/api/admin/site-identity", response_model=SiteIdentityResponse)
+def get_site_identity(db: Session = Depends(get_db), current_admin: dict = Depends(require_module("settings"))):
+    """Get site identity settings"""
+    setting = db.query(SiteSetting).filter(SiteSetting.key == "site_identity").first()
+    if not setting:
+        # Return default values if not set
+        return SiteIdentityResponse(
+            site_name="",
+            tagline="",
+            contact_form_notification_email="admin@example.com",
+            admin_email="admin@example.com",
+            timezone="UTC",
+            language="en-US"
+        )
+    return SiteIdentityResponse(**setting.value)
+
+
+@router.put("/api/admin/site-identity", response_model=SiteIdentityResponse)
+def update_site_identity(
+    site_identity: SiteIdentity,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_module("settings"))
+):
+    """Update site identity settings"""
+    existing = db.query(SiteSetting).filter(SiteSetting.key == "site_identity").first()
+    
+    if existing:
+        existing.value = site_identity.model_dump()
+        db.commit()
+        db.refresh(existing)
+    else:
+        new_setting = SiteSetting(key="site_identity", value=site_identity.model_dump())
+        db.add(new_setting)
+        db.commit()
+        db.refresh(new_setting)
+    
+    return SiteIdentityResponse(**existing.value if existing else new_setting.value)
+
+
+# ================= BRAND ASSETS =================
+
+@router.get("/api/admin/brand-assets", response_model=BrandAssetsResponse)
+def get_brand_assets(db: Session = Depends(get_db), current_admin: dict = Depends(require_module("settings"))):
+    """Get brand assets (logo, favicon, social media links)"""
+    setting = db.query(SiteSetting).filter(SiteSetting.key == "brand_assets").first()
+    if not setting:
+        return BrandAssetsResponse(
+            logo_url=None,
+            favicon_url=None,
+            social_media=SocialMediaLinks()
+        )
+    return BrandAssetsResponse(**setting.value)
+
+
+@router.put("/api/admin/brand-assets", response_model=BrandAssetsResponse)
+def update_brand_assets(
+    brand_assets: BrandAssets,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_module("settings"))
+):
+    """Update brand assets"""
+    existing = db.query(SiteSetting).filter(SiteSetting.key == "brand_assets").first()
+    
+    if existing:
+        existing.value = brand_assets.model_dump(exclude_none=False)
+        db.commit()
+        db.refresh(existing)
+    else:
+        new_setting = SiteSetting(key="brand_assets", value=brand_assets.model_dump(exclude_none=False))
+        db.add(new_setting)
+        db.commit()
+        db.refresh(new_setting)
+    
+    return BrandAssetsResponse(**existing.value if existing else new_setting.value)
+
+
+@router.post("/api/admin/brand-assets/upload-logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_module("settings"))
+):
+    """Upload logo file to Cloudinary"""
+    try:
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            resource_type="auto",
+            folder="site-branding/logos",
+            public_id=f"logo_{uuid.uuid4()}"
+        )
+        
+        # Save to database
+        existing = db.query(SiteSetting).filter(SiteSetting.key == "brand_assets").first()
+        if existing:
+            existing.value["logo_url"] = upload_result["secure_url"]
+            existing.value["logo_public_id"] = upload_result["public_id"]
+        else:
+            existing = SiteSetting(
+                key="brand_assets",
+                value={
+                    "logo_url": upload_result["secure_url"],
+                    "logo_public_id": upload_result["public_id"]
+                }
+            )
+            db.add(existing)
+        
+        db.commit()
+        return {"success": True, "url": upload_result["secure_url"], "public_id": upload_result["public_id"]}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/api/admin/brand-assets/upload-favicon")
+async def upload_favicon(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(require_module("settings"))
+):
+    """Upload favicon file to Cloudinary"""
+    try:
+        upload_result = cloudinary.uploader.upload(
+            file.file,
+            resource_type="auto",
+            folder="site-branding/favicons",
+            public_id=f"favicon_{uuid.uuid4()}"
+        )
+        
+        # Save to database
+        existing = db.query(SiteSetting).filter(SiteSetting.key == "brand_assets").first()
+        if existing:
+            existing.value["favicon_url"] = upload_result["secure_url"]
+            existing.value["favicon_public_id"] = upload_result["public_id"]
+        else:
+            existing = SiteSetting(
+                key="brand_assets",
+                value={
+                    "favicon_url": upload_result["secure_url"],
+                    "favicon_public_id": upload_result["public_id"]
+                }
+            )
+            db.add(existing)
+        
+        db.commit()
+        return {"success": True, "url": upload_result["secure_url"], "public_id": upload_result["public_id"]}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ================= ADMIN — Inbox Dekhna =================
@@ -816,7 +1391,7 @@ async def upload_media(
     db.refresh(media)
 
     await notify(
-        user_id=current_admin.get("email", "admin") if current_admin else "admin",
+        user_id=resolve_notification_user_id(current_admin, db=db),
         resource_type="media",
         resource_id=str(media.id),
         type_="created",
@@ -844,3 +1419,198 @@ async def delete_media(media_id: int, db: Session = Depends(get_db), current_adm
 
 
 
+@router.post("/api/admin/leads", response_model=LeadsResponse)
+async def create_lead(
+    message: LeadsResponse,
+    db: Session = Depends(get_db)
+):
+    new_lead = Lead(
+        username=message.username,
+        email=message.email,
+        phone=message.phone,
+        service_type=message.service_type,
+        city=message.city,
+    )
+
+    db.add(new_lead)
+    db.commit()
+    db.refresh(new_lead)
+
+    admin_user = db.query(AdminUser).order_by(AdminUser.id.asc()).first()
+    await notify(
+        user_id=resolve_notification_user_id({"email": admin_user.email} if admin_user and admin_user.email else None, db=db),
+        resource_type="lead",
+        resource_id=str(new_lead.id),
+        type_="created",
+        title="New lead received",
+        message=f"Lead from {new_lead.username} ({new_lead.email})",
+        db=db,
+    )
+
+    return new_lead
+
+
+
+@router.get("/api/admin/leads", response_model=list[LeadsResponse])
+async def get_leads(
+    db: Session = Depends(get_db),
+    skip: int = 0,
+    limit: int = 50,
+):
+    leads = (
+        db.query(Lead)
+        .order_by(Lead.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+    return leads
+
+@router.patch("/api/admin/leads/{lead_id}", response_model=LeadsResponse)
+async def update_lead(
+    lead_id: int,
+    lead_update: LeadsResponse,
+    db: Session = Depends(get_db)
+):
+    lead = db.query(Lead).filter(Lead.id == lead_id).first()
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    lead.username = lead_update.username
+    lead.email = lead_update.email
+    lead.phone = lead_update.phone
+    lead.service_type = lead_update.service_type
+    lead.city = lead_update.city
+
+    db.commit()
+    db.refresh(lead)
+
+    admin_user = db.query(AdminUser).order_by(AdminUser.id.asc()).first()
+    await notify(
+        user_id=resolve_notification_user_id({"email": admin_user.email} if admin_user and admin_user.email else None, db=db),
+        resource_type="lead",
+        resource_id=str(lead.id),
+        type_="updated",
+        title="Lead updated",
+        message=f"Lead {lead.username} ({lead.email}) was updated",
+        db=db,
+    )
+
+    return lead
+
+
+
+def get_leads_for_export(db: Session, payload: LeadExportRequest) -> list[Lead]:
+    query = db.query(Lead)
+
+    if payload.select_all:
+        if payload.service_type:
+            query = query.filter(Lead.service_type == payload.service_type)
+    elif payload.lead_ids:
+        query = query.filter(Lead.id.in_(payload.lead_ids))
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either lead_ids or set select_all=true",
+        )
+
+    leads = query.order_by(Lead.created_at.desc()).all()
+    if not leads:
+        raise HTTPException(status_code=404, detail="No leads found for export")
+
+    return leads
+
+
+def resolve_fields(fields: list[str] | None) -> list[str]:
+    selected = fields or list(FIELD_MAP.keys())
+    invalid = [f for f in selected if f not in FIELD_MAP]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Invalid fields: {invalid}")
+    return selected
+
+
+def build_csv(leads: list[Lead], fields: list[str]) -> io.StringIO:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([FIELD_MAP[f][0] for f in fields])
+    for lead in leads:
+        writer.writerow([FIELD_MAP[f][1](lead) for f in fields])
+    buffer.seek(0)
+    return buffer
+
+
+def build_excel(leads: list[Lead], fields: list[str]) -> io.BytesIO:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Leads"
+    ws.append([FIELD_MAP[f][0] for f in fields])
+    for lead in leads:
+        ws.append([FIELD_MAP[f][1](lead) for f in fields])
+
+    for col_cells in ws.columns:
+        max_len = max(len(str(c.value)) for c in col_cells if c.value is not None)
+        ws.column_dimensions[col_cells[0].column_letter].width = max_len + 4
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def build_pdf(leads: list[Lead], fields: list[str]) -> io.BytesIO:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4))
+
+    header = [FIELD_MAP[f][0] for f in fields]
+    rows = [[str(FIELD_MAP[f][1](lead)) for f in fields] for lead in leads]
+    data = [header] + rows
+
+    table = Table(data, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2d2d2d")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2f2f2")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+
+    doc.build([table])
+    buffer.seek(0)
+    return buffer
+
+
+
+@router.post("/api/admin/leads/download")
+async def download_leads(
+    payload: LeadExportRequest,
+    db: Session = Depends(get_db),
+    # admin: AdminUser = Depends(get_current_admin_user),
+):
+    leads = get_leads_for_export(db, payload)
+    fields = resolve_fields(payload.fields)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    if payload.format == "csv":
+        buffer = build_csv(leads, fields)
+        return StreamingResponse(
+            iter([buffer.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=leads_{timestamp}.csv"},
+        )
+
+    if payload.format == "excel":
+        buffer = build_excel(leads, fields)
+        return StreamingResponse(
+            buffer,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename=leads_{timestamp}.xlsx"},
+        )
+
+    if payload.format == "pdf":
+        buffer = build_pdf(leads, fields)
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename=leads_{timestamp}.pdf"},
+        )

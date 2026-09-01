@@ -1,18 +1,75 @@
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
-from typing import Optional, Any
+from typing import Optional, Any, Union
 from datetime import datetime
 from .enums import ServiceType
+from typing import Literal
+
+
+
+
 
 # ---------- Admin User ----------
 class AdminUserCreate(BaseModel):
     name: str
     email: str
     password: str
+    role: str = "admin"
 
 class AdminUserResponse(BaseModel):
     id: int
+    name: Optional[str] = None
     email: str
     role: str
+    profile_image: Optional[str] = None
+    phone_number: Optional[str] = None
+    bio: Optional[str] = None
+    model_config = ConfigDict(from_attributes=True)
+
+class AdminProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    profile_image: Optional[str] = None
+    phone_number: Optional[str] = None
+    bio: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+
+class MeResponse(BaseModel):
+    name: Optional[str] = None
+    email: str
+    role: str
+    profile_image: Optional[str] = None
+    phone_number: Optional[str] = None
+    bio: Optional[str] = None
+    permissions: list[str]
+    model_config = ConfigDict(from_attributes=True)
+
+class RoleCreate(BaseModel):
+    name: str
+    label: Optional[str] = None
+    modules: list[Union[str, dict]] = []
+
+class RoleUpdate(BaseModel):
+    label: Optional[str] = None
+    modules: Optional[list[Union[str, dict]]] = None
+
+class RoleResponse(BaseModel):
+    name: str
+    label: Optional[str] = None
+    modules: list[Union[str, dict]]
+    model_config = ConfigDict(from_attributes=True)
+
+class AssignRoleRequest(BaseModel):
+    """Request to assign a role to a user"""
+    user_id: int
+    role: str
+
+class AdminUserWithRoleResponse(BaseModel):
+    """Admin user response with role info"""
+    id: int
+    name: Optional[str] = None
+    email: str
+    role: str
+    created_at: Optional[datetime] = None
     model_config = ConfigDict(from_attributes=True)
 
 # ---------- Login ----------
@@ -64,6 +121,46 @@ class SiteSettingResponse(BaseModel):
     key: str
     value: dict
     model_config = ConfigDict(from_attributes=True)
+
+# ---------- Site Identity ----------
+class SiteIdentity(BaseModel):
+    site_name: str
+    tagline: Optional[str] = None
+    contact_form_notification_email: EmailStr
+    admin_email: EmailStr
+    timezone: str = "UTC"
+    language: str = "en-US"
+
+class SiteIdentityResponse(BaseModel):
+    site_name: str
+    tagline: Optional[str] = None
+    contact_form_notification_email: EmailStr
+    admin_email: EmailStr
+    timezone: str
+    language: str
+
+# ---------- Brand Assets ----------
+class SocialMediaLinks(BaseModel):
+    twitter: Optional[str] = None
+    linkedin: Optional[str] = None
+    instagram: Optional[str] = None
+    facebook: Optional[str] = None
+    youtube: Optional[str] = None
+    whatsapp: Optional[str] = None
+
+class BrandAssets(BaseModel):
+    logo_url: Optional[str] = None
+    logo_public_id: Optional[str] = None
+    favicon_url: Optional[str] = None
+    favicon_public_id: Optional[str] = None
+    social_media: Optional[SocialMediaLinks] = None
+
+class BrandAssetsResponse(BaseModel):
+    logo_url: Optional[str] = None
+    logo_public_id: Optional[str] = None
+    favicon_url: Optional[str] = None
+    favicon_public_id: Optional[str] = None
+    social_media: Optional[SocialMediaLinks] = None
     
     
 class MessageCreate(BaseModel):
@@ -142,6 +239,7 @@ class MarkReadRequest(BaseModel):
 class ContactFormIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     email: EmailStr
+    phone: str = Field(..., min_length=1, max_length=20)
     subject: str = Field(..., min_length=1, max_length=500)
     message: str = Field(..., min_length=1)
 
@@ -160,4 +258,26 @@ class XlsxImportResponse(BaseModel):
     status: str
     created_at: Optional[datetime] = None
     model_config = ConfigDict(from_attributes=True)
+    
+    
+# app/schema.py
+class LeadsResponse(BaseModel):
+    id: int
+    username: str
+    email: EmailStr
+    phone: str
+    service_type: ServiceType
+    created_at: datetime
+    city: str
 
+    model_config = ConfigDict(from_attributes=True)
+    
+class LeadExportRequest(BaseModel):
+    format: Literal["csv", "excel", "pdf"] = "csv"
+    lead_ids: list[int] | None = None
+    select_all: bool = False
+    service_type: ServiceType | None = None
+    fields: list[str] | None = None  # if None, export all fields
+    
+    
+    

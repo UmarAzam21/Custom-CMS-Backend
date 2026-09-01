@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 
 from app import models
 from app.db import get_db
-
+from app.auth import get_current_admin, require_module_access
+from app.enums import ModuleAccess
 from app.schema import ContactFormIn, ContactFormOut
 from app.support_system import crud
 from app.support_system.config import settings
@@ -54,7 +55,7 @@ def require_admin() -> str:
 
 @router.post("/contact", response_model=ContactFormOut)
 def submit_contact_form(payload: ContactFormIn, db: Session = Depends(get_db)):
-    customer = crud.get_or_create_customer(db, email=payload.email, name=payload.name)
+    customer = crud.get_or_create_customer(db, email=payload.email, name=payload.name, phone=payload.phone)
     ticket = crud.create_ticket_with_message(
         db, customer=customer, subject=payload.subject, body=payload.message
     )
@@ -83,9 +84,9 @@ def submit_contact_form(payload: ContactFormIn, db: Session = Depends(get_db)):
 
 @router.get("/admin")
 def admin_dashboard(
-    request: Request, db: Session = Depends(get_db), admin: str = Depends(require_admin)
+    request: Request, db: Session = Depends(get_db), current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.READ))
 ):
-    tickets = crud.list_tickets(db)
+    tickets = crud.list_tickets(db, current_admin=current_admin)
     return [ _serialize_ticket(t) for t in tickets ]
 
 
@@ -94,9 +95,9 @@ def admin_ticket_detail(
     ticket_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    admin: str = Depends(require_admin),
+    current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.READ)),
 ):
-    ticket = crud.get_ticket(db, ticket_id)
+    ticket = crud.get_ticket(db, ticket_id, current_admin=current_admin)
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return _serialize_ticket(ticket)
@@ -106,9 +107,9 @@ def admin_ticket_detail(
 def admin_ticket_reply_to(
     ticket_id: int,
     db: Session = Depends(get_db),
-    admin: str = Depends(require_admin),
+    current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.READ)),
 ):
-    ticket = crud.get_ticket(db, ticket_id)
+    ticket = crud.get_ticket(db, ticket_id, current_admin=current_admin)
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
     return {"ticket_id": ticket_id, "reply_to": ticket.reply_to_address}
@@ -119,9 +120,9 @@ def admin_reply(
     ticket_id: int,
     body: str = Form(...),
     db: Session = Depends(get_db),
-    admin: str = Depends(require_admin),
+    current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.UPDATE)),
 ):
-    ticket = crud.get_ticket(db, ticket_id)
+    ticket = crud.get_ticket(db, ticket_id, current_admin=current_admin)
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -138,6 +139,7 @@ def admin_reply(
         direction=models.MessageDirection.OUTBOUND,
         sender_email=settings.SMTP_USER,
         body=body,
+        current_admin=current_admin,
     )
     return {"status": "sent", "ticket_id": ticket_id}
 
@@ -146,9 +148,9 @@ def admin_reply(
 def admin_close_ticket(
     ticket_id: int,
     db: Session = Depends(get_db),
-    admin: str = Depends(require_admin),
+    current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.UPDATE)),
 ):
-    ticket = crud.get_ticket(db, ticket_id)
+    ticket = crud.get_ticket(db, ticket_id, current_admin=current_admin)
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -166,9 +168,9 @@ def simulate_reply(
     sender_email: str = Form(...),
     body: str = Form(...),
     db: Session = Depends(get_db),
-    admin: str = Depends(require_admin),
+    current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.UPDATE)),
 ):
-    ticket = crud.get_ticket(db, ticket_id)
+    ticket = crud.get_ticket(db, ticket_id, current_admin=current_admin)
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -178,6 +180,7 @@ def simulate_reply(
         direction=models.MessageDirection.INBOUND,
         sender_email=sender_email,
         body=body,
+        current_admin=current_admin,
     )
 
     return {"status": "simulated", "message": _serialize_message(msg), "ticket": _serialize_ticket(ticket)}
@@ -188,7 +191,7 @@ def simulate_reply(
 def trigger_imap_processing(
     background_tasks: BackgroundTasks,
     sync: bool = False,
-    admin: str = Depends(require_admin),
+    current_admin: dict = Depends(require_module_access("support_system", ModuleAccess.UPDATE)),
 ):
     if sync:
         try:

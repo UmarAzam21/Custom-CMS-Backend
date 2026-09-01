@@ -1,14 +1,19 @@
 import bcrypt
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from .db import get_db
+from .models import AdminUser, Role
+from .enums import ModuleAccess
 
 SECRET_KEY = "your-secret-key-change-this"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 din
 
-security = HTTPBearer(auto_error=False)  # allow missing/invalid tokens for testing
+security = HTTPBearer(auto_error=False)
 
 
 def hash_password(password: str) -> str:
@@ -27,7 +32,119 @@ def decode_access_token(token: str):
     return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
 
 
-def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    # Temporarily bypass authorization checks so the frontend can access admin routes.
-    # Re-enable this later when real auth is added.
-    return {"email": "admin@local.test", "role": "admin"}
+def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication credentials were not provided.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = credentials.credentials
+    try:
+        payload = decode_access_token(token)
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    email = payload.get("sub")
+    if not email:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token payload is missing the subject.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.query(AdminUser).filter(AdminUser.email == email).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    role_name = user.role or "admin"
+    is_superadmin = role_name == "superadmin"
+    role = db.query(Role).filter(Role.name == role_name).first()
+
+    # Super admin has full access, otherwise get modules from role
+    if is_superadmin:
+        modules = ["*"]
+    else:
+        modules = role.modules if role is not None else ()
+
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "role": role_name,
+        "is_superadmin": is_superadmin,
+        "modules": modules,
+    }
+
+
+def require_module(module_name: str):
+    def dependency(current_admin: dict = Depends(get_current_admin)):
+        modules = current_admin.get("modules", [])
+        if "*" in modules or module_name in modules:
+            return current_admin
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied.",
+        )
+
+    return dependency
+
+
+def require_module_access(module_name: str, access_level: ModuleAccess):
+    """Check if user has the required access level for a module.
+
+    Args:
+        module_name: The name of the module
+        access_level: The required access level (READ, UPDATE, or ALL)
+    """
+    def dependency(current_admin: dict = Depends(get_current_admin)):
+        modules = current_admin.get("modules", [])
+
+        # Admin users with "*" have full access
+        if "*" in modules:
+            return current_admin
+
+        # Check for module access
+        for module in modules:
+            if isinstance(module, dict):
+                # New format: {"module_name": "access_level"}
+                if module_name in module:
+                    user_access = module[module_name].lower()
+                    required_access = access_level.value.lower()
+
+                    # ALL access covers everything, UPDATE covers READ and UPDATE, READ is READ only
+                    if user_access == "all" or user_access == required_access or (user_access == "update" and required_access == "read"):
+                        return current_admin
+            elif module == module_name:
+                # Backward compatible: simple module name in list = UPDATE access
+                if access_level in [ModuleAccess.UPDATE, ModuleAccess.ALL]:
+                    return current_admin
+                elif access_level == ModuleAccess.READ:
+                    # READ access granted if module is in list (backward compatible)
+                    return current_admin
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied. Required {access_level.value} access to {module_name}.",
+        )
+
+    return dependency
+
+
+def require_super_admin(current_admin: dict = Depends(get_current_admin)):
+    """Check if user is a super admin."""
+    if not current_admin.get("is_superadmin", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only super admin can access this resource.",
+        )
+    return current_admin

@@ -31,6 +31,15 @@ from app import models
 target_metadata = Base.metadata
 
 
+def include_object(object, name, type_, reflected, compare_to):
+    """Exclude runtime-generated dataset tables and the current_dataset view from Alembic autogenerate."""
+    if type_ == "table" and name.startswith("dataset_"):
+        return False
+    if type_ == "view" and name == "current_dataset":
+        return False
+    return True
+
+
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")

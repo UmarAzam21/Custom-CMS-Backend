@@ -30,7 +30,16 @@ class AdminUser(Base):
     email = Column(String(255), unique=True, index=True)
     password_hash = Column(String(255))
     role = Column(String(50), default="admin")
+    profile_image = Column(String(1000), nullable=True)
+    phone_number = Column(String(50), nullable=True)
+    bio = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
+
+class Role(Base):
+    __tablename__ = "roles"
+    name = Column(String(50), primary_key=True, index=True)
+    label = Column(String(255), nullable=True)
+    modules = Column(JSON, nullable=False, default=list)
 
 class Page(Base):
     __tablename__ = "pages"
@@ -68,7 +77,6 @@ class Media(Base):
     height = Column(Integer, nullable=True)
     bytes = Column(Integer, nullable=True)
     uploaded_at = Column(TIMESTAMP, server_default=func.now())
-    
     
 class Message(Base):
     __tablename__ = "messages"
@@ -142,6 +150,7 @@ class SupportCustomer(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String(320), unique=True, index=True, nullable=False)
     name = Column(String(255), nullable=True)
+    phone = Column(String(20), nullable=True)
     created_at = Column(DateTime(timezone=True), default=utcnow)
 
     tickets = relationship("SupportTicket", back_populates="customer")
@@ -204,3 +213,16 @@ class XlsxImport(Base):
     created_at = Column(DateTime(timezone=True), default=utcnow)
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     error_message = Column(Text, nullable=True)
+
+
+
+class Lead(Base):
+    __tablename__ = "leads"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(255), nullable=False)
+    email = Column(String(320), nullable=False)
+    phone = Column(String(20), nullable=False)
+    service_type = Column(SAEnum(ServiceType), nullable=False)
+    city = Column(String(100), nullable=False)
+    created_at = Column(DateTime(timezone=False), default=utcnow)
