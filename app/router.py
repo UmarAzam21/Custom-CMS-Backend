@@ -6,9 +6,15 @@ import cloudinary
 import cloudinary.uploader
 from xml.etree import ElementTree as ET
 
+<<<<<<< Updated upstream
 from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, BackgroundTasks
+=======
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.security import HTTPAuthorizationCredentials
+from jose import JWTError
+>>>>>>> Stashed changes
 from sqlalchemy.orm import Session
 from .enums import ServiceType
 from app.email_utils import send_email
@@ -38,9 +44,15 @@ from .schema import (
     SocialMediaLinks,
     Token,
     AdminUserCreate,
+    AdminUserUpdate,
     AdminUserResponse,
+<<<<<<< Updated upstream
     AdminProfileUpdate,
     MeResponse,
+=======
+    AssignRoleRequest,
+    RolePayload,
+>>>>>>> Stashed changes
     PageCreate,
     PageResponse,
     NotificationCreate,
@@ -51,6 +63,7 @@ from .schema import (
     LeadExportRequest,
 )
 
+<<<<<<< Updated upstream
 import csv
 from fastapi.responses import StreamingResponse
 
@@ -65,6 +78,19 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
 
 from .auth import hash_password, verify_password, create_access_token, get_current_admin, require_module, require_super_admin
 from .init_roles import init_builtin_roles, get_builtin_role_names
+=======
+from .auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    decode_access_token,
+    get_current_admin,
+    get_current_super_admin,
+    security,
+    _payload_from_credentials,
+)
+from fastapi.security import HTTPAuthorizationCredentials
+>>>>>>> Stashed changes
 
 import os
 from pathlib import Path
@@ -463,6 +489,7 @@ async def websocket_notifications(websocket: WebSocket, user_id: str):
     finally:
         await ws_manager.disconnect(user_id, websocket)
 
+<<<<<<< Updated upstream
 # ---------- Bootstrap Superadmin ----------
 @router.get("/api/admin/diagnosis")
 def diagnose_admin_users(db: Session = Depends(get_db)):
@@ -524,6 +551,15 @@ def create_superadmin(user: AdminUserCreate, db: Session = Depends(get_db)):
 @router.post("/api/admin/users", response_model=AdminUserResponse)
 def create_admin_user(user: AdminUserCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
     """Create a new admin user. Only super admin can create users."""
+=======
+# ---------- Create Admin (regular admin, super_admin only) ----------
+@router.post("/api/admin/create-user", response_model=AdminUserResponse)
+def create_admin(
+    user: AdminUserCreate,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+>>>>>>> Stashed changes
     existing = db.query(AdminUser).filter(AdminUser.email == user.email).first()
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -532,7 +568,43 @@ def create_admin_user(user: AdminUserCreate, db: Session = Depends(get_db), curr
         name=user.name,
         email=user.email,
         password_hash=hash_password(user.password),
+<<<<<<< Updated upstream
         role=user.role or "admin"
+=======
+        role="admin",
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+# ---------- Create Super Admin ----------
+# First super admin can be created without a token. After that, only a super admin can create another.
+@router.post("/api/admin/create-super-admin", response_model=AdminUserResponse)
+def create_super_admin(
+    user: AdminUserCreate,
+    db: Session = Depends(get_db),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    existing = db.query(AdminUser).filter(AdminUser.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    super_admin_exists = (
+        db.query(AdminUser).filter(AdminUser.role == "super_admin").first() is not None
+    )
+    if super_admin_exists:
+        payload = _payload_from_credentials(credentials)
+        if payload.get("role") != "super_admin":
+            raise HTTPException(status_code=403, detail="Super admin access required")
+
+    new_user = AdminUser(
+        name=user.name,
+        email=user.email,
+        password_hash=hash_password(user.password),
+        role="super_admin",
+>>>>>>> Stashed changes
     )
     db.add(new_user)
     db.commit()
@@ -593,6 +665,7 @@ def login(credentials: LoginRequest, db: Session = Depends(get_db)):
 
 
         #   Protected Route
+<<<<<<< Updated upstream
         
 @router.get("/api/admin/me")
 def read_current_admin(current_admin: dict = Depends(get_current_admin)):
@@ -729,11 +802,179 @@ def update_own_profile(
             raise HTTPException(status_code=400, detail="New password must be at least 6 characters long.")
         user.password_hash = hash_password(payload.new_password.strip())
 
+=======
+          
+
+SITE_IDENTITY_KEY = "site_identity"
+BRAND_ASSETS_KEY = "brand_assets"
+CUSTOM_ROLES_KEY = "custom_roles"
+BUILTIN_ROLES = [
+    {
+        "name": "super_admin",
+        "label": "Super Admin",
+        "description": "Full access to every module, users, and roles",
+        "modules": ["*"],
+    },
+    {
+        "name": "admin",
+        "label": "Admin",
+        "description": "Standard administrator",
+        "modules": [],
+    },
+]
+
+
+def _setting_value(db: Session, key: str) -> dict:
+    row = db.query(SiteSetting).filter(SiteSetting.key == key).first()
+    if not row or not isinstance(row.value, dict):
+        return {}
+    return dict(row.value)
+
+
+def _upsert_setting(db: Session, key: str, value: dict, merge: bool = True) -> dict:
+    existing = db.query(SiteSetting).filter(SiteSetting.key == key).first()
+    if existing:
+        existing.value = {**(existing.value or {}), **value} if merge else value
+        db.commit()
+        db.refresh(existing)
+        return existing.value
+    row = SiteSetting(key=key, value=value)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row.value
+
+
+def _custom_roles(db: Session) -> list:
+    items = _setting_value(db, CUSTOM_ROLES_KEY).get("items")
+    return items if isinstance(items, list) else []
+
+
+def _save_custom_roles(db: Session, items: list) -> list:
+    _upsert_setting(db, CUSTOM_ROLES_KEY, {"items": items}, merge=False)
+    return items
+
+
+def _all_roles(db: Session) -> list:
+    custom = _custom_roles(db)
+    builtin_names = {role["name"] for role in BUILTIN_ROLES}
+    return [*BUILTIN_ROLES, *[role for role in custom if role.get("name") not in builtin_names]]
+
+
+def _get_admin_user(db: Session, user_id: str) -> AdminUser:
+    user = db.query(AdminUser).filter(AdminUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def _require_cloudinary():
+    if not os.getenv("CLOUDINARY_CLOUD_NAME") or not os.getenv("CLOUDINARY_API_KEY") or not os.getenv("CLOUDINARY_API_SECRET"):
+        raise HTTPException(
+            status_code=500,
+            detail="Cloudinary credentials are not configured.",
+        )
+
+
+@router.get("/api/admin/me")
+def read_current_admin(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    email = None
+    role = None
+    if credentials and credentials.credentials:
+        try:
+            payload = decode_access_token(credentials.credentials)
+            email = payload.get("sub")
+            role = payload.get("role")
+        except JWTError:
+            pass
+
+    user = db.query(AdminUser).filter(AdminUser.email == email).first() if email else None
+    if user:
+        is_super = user.role == "super_admin"
+        return {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "role": user.role,
+            "is_superadmin": is_super,
+            "modules": ["*"] if is_super else [],
+            "logged_in_as": {"email": user.email, "role": user.role},
+        }
+
+    fallback_role = role or current_admin.get("role")
+    fallback_email = email or current_admin.get("email")
+    is_super = fallback_role == "super_admin"
+    return {
+        "id": None,
+        "email": fallback_email,
+        "name": fallback_email,
+        "role": fallback_role,
+        "is_superadmin": is_super,
+        "modules": ["*"] if is_super else [],
+        "logged_in_as": current_admin,
+    }
+
+
+@router.get("/api/admin/users", response_model=list[AdminUserResponse])
+def list_users(
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    return db.query(AdminUser).order_by(AdminUser.id.desc()).all()
+
+
+@router.post("/api/admin/users", response_model=AdminUserResponse)
+def create_user(
+    payload: AdminUserCreate,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    existing = db.query(AdminUser).filter(AdminUser.email == payload.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    new_user = AdminUser(
+        name=payload.name,
+        email=payload.email,
+        password_hash=hash_password(payload.password),
+        role=payload.role or "admin",
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return new_user
+
+
+@router.put("/api/admin/users/{user_id}", response_model=AdminUserResponse)
+def update_user(
+    user_id: int,
+    payload: AdminUserUpdate,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    user = _get_admin_user(db, user_id)
+    if payload.name is not None:
+        user.name = payload.name
+    if payload.email is not None:
+        taken = db.query(AdminUser).filter(AdminUser.email == payload.email, AdminUser.id != user_id).first()
+        if taken:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        user.email = payload.email
+    if payload.password:
+        user.password_hash = hash_password(payload.password)
+    if payload.role is not None:
+        user.role = payload.role
+>>>>>>> Stashed changes
     db.commit()
     db.refresh(user)
     return user
 
 
+<<<<<<< Updated upstream
 @router.post("/api/admin/roles", response_model=RoleResponse)
 def create_role(role: RoleCreate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
     """Create a new role with module access levels. Only super admin can create roles."""
@@ -758,11 +999,96 @@ def list_roles(db: Session = Depends(get_db), current_admin: dict = Depends(requ
 def get_role(role_name: str, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
     """Get a specific role. Only super admin can view roles."""
     role = db.query(Role).filter(Role.name == role_name).first()
+=======
+@router.delete("/api/admin/users/{user_id}")
+def delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    user = _get_admin_user(db, user_id)
+    if user.role == "super_admin":
+        remaining = db.query(AdminUser).filter(AdminUser.role == "super_admin", AdminUser.id != user_id).count()
+        if remaining == 0:
+            raise HTTPException(status_code=400, detail="Cannot delete the last super admin")
+    db.delete(user)
+    db.commit()
+    return {"status": "deleted"}
+
+
+@router.post("/api/admin/users/{user_id}/assign-role", response_model=AdminUserResponse)
+def assign_user_role(
+    user_id: int,
+    payload: AssignRoleRequest,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    user = _get_admin_user(db, user_id)
+    user.role = payload.role
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.get("/api/admin/roles")
+def list_roles(
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    return _all_roles(db)
+
+
+@router.post("/api/admin/roles")
+def create_role(
+    payload: RolePayload,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Role name is required")
+    existing = next((role for role in _all_roles(db) if role.get("name") == name), None)
+    if existing:
+        raise HTTPException(status_code=400, detail="Role already exists")
+    role = {
+        "name": name,
+        "label": payload.label or name.replace("_", " ").title(),
+        "description": payload.description,
+        "modules": payload.modules or [],
+    }
+    items = _custom_roles(db)
+    items.append(role)
+    _save_custom_roles(db, items)
+    return role
+
+
+@router.get("/api/admin/roles/builtin/list")
+def list_builtin_roles(current_super_admin: dict = Depends(get_current_super_admin)):
+    return BUILTIN_ROLES
+
+
+@router.post("/api/admin/roles/init-builtin")
+def init_builtin_roles(
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    return _all_roles(db)
+
+
+@router.get("/api/admin/roles/{role_name}")
+def get_role(
+    role_name: str,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    role = next((item for item in _all_roles(db) if item.get("name") == role_name), None)
+>>>>>>> Stashed changes
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
     return role
 
 
+<<<<<<< Updated upstream
 @router.put("/api/admin/roles/{role_name}", response_model=RoleResponse)
 def update_role(role_name: str, payload: RoleUpdate, db: Session = Depends(get_db), current_admin: dict = Depends(require_super_admin)):
     """Update a role's modules and access levels. Only super admin can update roles."""
@@ -809,6 +1135,159 @@ def list_builtin_roles(current_admin: dict = Depends(require_super_admin)):
     """List all built-in role names. Only super admin can view."""
     builtin_roles = get_builtin_role_names()
     return {"builtin_roles": builtin_roles, "count": len(builtin_roles)}
+=======
+@router.put("/api/admin/roles/{role_name}")
+def update_role(
+    role_name: str,
+    payload: RolePayload,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    items = _custom_roles(db)
+    for item in items:
+        if item.get("name") == role_name:
+            if payload.label is not None:
+                item["label"] = payload.label
+            if payload.description is not None:
+                item["description"] = payload.description
+            if payload.modules is not None:
+                item["modules"] = payload.modules
+            if payload.name and payload.name != role_name:
+                item["name"] = payload.name
+            _save_custom_roles(db, items)
+            return item
+    builtin = next((item for item in BUILTIN_ROLES if item["name"] == role_name), None)
+    if builtin:
+        return {**builtin, "description": payload.description or builtin.get("description")}
+    raise HTTPException(status_code=404, detail="Role not found")
+
+
+@router.delete("/api/admin/roles/{role_name}")
+def delete_role(
+    role_name: str,
+    db: Session = Depends(get_db),
+    current_super_admin: dict = Depends(get_current_super_admin),
+):
+    if any(item["name"] == role_name for item in BUILTIN_ROLES):
+        raise HTTPException(status_code=400, detail="Cannot delete a built-in role")
+    items = [item for item in _custom_roles(db) if item.get("name") != role_name]
+    _save_custom_roles(db, items)
+    return {"status": "deleted"}
+
+
+@router.get("/api/admin/site-identity")
+def get_site_identity(
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    value = _setting_value(db, SITE_IDENTITY_KEY)
+    form_email = value.get("form_email") or value.get("contact_form_notification_email") or ""
+    return {
+        "site_name": value.get("site_name", ""),
+        "tagline": value.get("tagline", ""),
+        "form_email": form_email,
+        "contact_form_notification_email": form_email,
+        "admin_email": value.get("admin_email", ""),
+        "timezone": value.get("timezone", ""),
+        "language": value.get("language", ""),
+    }
+
+
+@router.put("/api/admin/site-identity")
+def update_site_identity(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    form_email = payload.get("contact_form_notification_email") or payload.get("form_email")
+    stored = _upsert_setting(
+        db,
+        SITE_IDENTITY_KEY,
+        {
+            "site_name": payload.get("site_name"),
+            "tagline": payload.get("tagline"),
+            "form_email": form_email,
+            "contact_form_notification_email": form_email,
+            "admin_email": payload.get("admin_email"),
+            "timezone": payload.get("timezone"),
+            "language": payload.get("language"),
+        },
+    )
+    return stored
+
+
+@router.get("/api/admin/brand-assets")
+def get_brand_assets(
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    value = _setting_value(db, BRAND_ASSETS_KEY)
+    return {
+        "logo_url": value.get("logo_url"),
+        "favicon_url": value.get("favicon_url"),
+        "social_media": value.get("social_media") or {},
+    }
+
+
+@router.put("/api/admin/brand-assets")
+def update_brand_assets(
+    payload: dict,
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    updates = {}
+    if "social_media" in payload:
+        updates["social_media"] = payload.get("social_media") or {}
+    if "logo_url" in payload:
+        updates["logo_url"] = payload.get("logo_url")
+    if "favicon_url" in payload:
+        updates["favicon_url"] = payload.get("favicon_url")
+    stored = _upsert_setting(db, BRAND_ASSETS_KEY, updates)
+    return {
+        "logo_url": stored.get("logo_url"),
+        "favicon_url": stored.get("favicon_url"),
+        "social_media": stored.get("social_media") or {},
+    }
+
+
+async def _save_brand_image(file: UploadFile, field: str, db: Session) -> dict:
+    _require_cloudinary()
+    try:
+        result = cloudinary.uploader.upload(
+            file.file,
+            resource_type="image",
+            folder="filernow/brand",
+            overwrite=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    stored = _upsert_setting(db, BRAND_ASSETS_KEY, {field: result.get("secure_url")})
+    return {
+        "logo_url": stored.get("logo_url"),
+        "favicon_url": stored.get("favicon_url"),
+        "social_media": stored.get("social_media") or {},
+        field: result.get("secure_url"),
+    }
+
+
+@router.post("/api/admin/brand-assets/upload-logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    return await _save_brand_image(file, "logo_url", db)
+
+
+@router.post("/api/admin/brand-assets/upload-favicon")
+async def upload_favicon(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_admin: dict = Depends(get_current_admin),
+):
+    return await _save_brand_image(file, "favicon_url", db)
+>>>>>>> Stashed changes
 
 
 @router.post("/api/admin/pages", response_model=PageResponse)

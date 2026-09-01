@@ -2,6 +2,8 @@ import bcrypt
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, timezone
+from typing import Optional
+
 from fastapi import Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -32,6 +34,7 @@ def decode_access_token(token: str):
     return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
 
 
+<<<<<<< Updated upstream
 def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security), db: Session = Depends(get_db)):
     if credentials is None or not credentials.credentials:
         raise HTTPException(
@@ -148,3 +151,39 @@ def require_super_admin(current_admin: dict = Depends(get_current_admin)):
             detail="Only super admin can access this resource.",
         )
     return current_admin
+=======
+def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    # Temporarily bypass authorization checks so the frontend can access admin routes.
+    # Re-enable this later when real auth is added.
+    return {"email": "admin@local.test", "role": "admin"}
+
+
+def _payload_from_credentials(credentials: Optional[HTTPAuthorizationCredentials]) -> dict:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    try:
+        return decode_access_token(credentials.credentials)
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def get_current_super_admin(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    payload = _payload_from_credentials(credentials)
+    role = payload.get("role")
+    if role != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin access required",
+        )
+    return {"email": payload.get("sub"), "role": role}
+>>>>>>> Stashed changes

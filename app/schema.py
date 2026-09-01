@@ -13,7 +13,26 @@ class AdminUserCreate(BaseModel):
     name: str
     email: str
     password: str
+<<<<<<< Updated upstream
     role: str = "admin"
+=======
+    role: Optional[str] = None
+
+class AdminUserUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[str] = None
+    password: Optional[str] = None
+    role: Optional[str] = None
+
+class AssignRoleRequest(BaseModel):
+    role: str
+
+class RolePayload(BaseModel):
+    name: Optional[str] = None
+    label: Optional[str] = None
+    description: Optional[str] = None
+    modules: Optional[list] = None
+>>>>>>> Stashed changes
 
 class AdminUserResponse(BaseModel):
     id: int
